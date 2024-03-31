@@ -36,8 +36,12 @@
 #define DIV_UP(a,b)     (((a)+((b)-1))/(b))
 
 #define THREADS  128
-
-#define BIT_X_SPIN (4)
+/*
+#define BIT_X_SPIN (4) // Bits per spin
+#define BIT_MASK (0xF) 
+*/
+#define BIT_X_SPIN (2) // Bits per spin
+#define BIT_MASK (0x3) 
 
 #define CRIT_TEMP	(2.26918531421f)
 #define	ALPHA_DEF	(0.1f)
@@ -45,6 +49,9 @@
 
 #define MIN(a,b)	(((a)<(b))?(a):(b))
 #define MAX(a,b)	(((a)>(b))?(a):(b))
+
+#define COLD_START true
+
 
 // 2048+: 16, 16, 2, 1
 //  1024: 16, 16, 1, 2
@@ -54,8 +61,10 @@
 
 #define BLOCK_X (16)
 #define BLOCK_Y (16)
-#define BMULT_X (2)
-#define BMULT_Y (1)
+#ifndef BMULT_X
+#define BMULT_X (2) // = LOOP_X
+#endif
+#define BMULT_Y (1) // = LOOP_Y 
 
 #define MAX_GPU	(256)
 
@@ -77,7 +86,7 @@ __device__ __forceinline__ unsigned long long int __mypopc(const unsigned long l
 	return __popcll(x);
 }
 
-enum {C_BLACK, C_WHITE};
+enum {C_BLACK, C_WHITE}; // 0, 1
 
 __device__ __forceinline__ uint2 __mymake_int2(const unsigned int x,
 		                               const unsigned int y) {
@@ -89,55 +98,58 @@ __device__ __forceinline__ ulonglong2 __mymake_int2(const unsigned long long x,
 	return make_ulonglong2(x, y);
 }
 
-template<int BDIM_X,
-	 int BDIM_Y,
-	 int LOOP_X, 
-	 int LOOP_Y,
+template<int BDIM_X, // = 16 
+	 int BDIM_Y,     // = 16 
+	 int LOOP_X,     // = 1 or 2
+	 int LOOP_Y,     // = 1
 	 int BITXSP,
 	 int COLOR,
-	 typename INT_T,
-	 typename INT2_T>
-__global__  void latticeInit_k(const int devid,
-			       const long long seed,
-                               const int it,
-                               const long long begY,
-                               const long long dimX, // ld
-                                     INT2_T *__restrict__ vDst) {
+	 typename INT_T,  // unsigned long long = u64
+	 typename INT2_T, // ulonglong2 = u64_vec2
+	 bool COLD> // If true, initialize spins to 0 and ignore RNG
+__global__  void latticeInit_k(const int devid,    // = i
+            		     const long long seed,	
+                               const int it,       // == 0  What is it?
+                         const long long begY,     // = i*Y   Grid is split into slabs, each slap belowing to one GPU
+                         const long long dimX, // ld  = lld/2                                        // Note:  Using half of the dimension in x, dimX =lld/2 because
+	        		 INT2_T *__restrict__ vDst) // = black_d / white_d  = v_d / v_d + llen/2         //        calculation is using vec2, i.e. 32 spins per entry instead of 16 
+{ 
+	const int __i = blockIdx.y*BDIM_Y*LOOP_Y + threadIdx.y;  // local y-index inside block 
+	const int __j = blockIdx.x*BDIM_X*LOOP_X + threadIdx.x;  // local x-index inside tile, every even one
 
-	const int __i = blockIdx.y*BDIM_Y*LOOP_Y + threadIdx.y;
-	const int __j = blockIdx.x*BDIM_X*LOOP_X + threadIdx.x;
-
-	const int SPIN_X_WORD = 8*sizeof(INT_T)/BITXSP;
-
+	const int SPIN_X_WORD = 8*sizeof(INT_T)/BITXSP; // Spins per word = 16 
+ 
 	const long long tid = ((devid*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x)*BDIM_X*BDIM_Y +
-	                       threadIdx.y*BDIM_X + threadIdx.x;
+	                       threadIdx.y*BDIM_X + threadIdx.x;  // flat global index
 
 	curandStatePhilox4_32_10_t st;
-	curand_init(seed, tid, static_cast<long long>(2*SPIN_X_WORD)*LOOP_X*LOOP_Y*(2*it+COLOR), &st);
+	curand_init(seed, tid, static_cast<long long>(2*SPIN_X_WORD)*LOOP_X*LOOP_Y*(2*it+COLOR), &st); // (seed, subsequence, offset = B:0  W: 64, state)
 
 	INT2_T __tmp[LOOP_Y][LOOP_X];
 	#pragma unroll
 	for(int i = 0; i < LOOP_Y; i++) {
 		#pragma unroll
 		for(int j = 0; j < LOOP_X; j++) {
-			__tmp[i][j] = __mymake_int2(INT_T(0),INT_T(0));
+			__tmp[i][j] = __mymake_int2(INT_T(0),INT_T(0));  // saves 16*2*2=64 many spins
 		}
 	}
-
-	#pragma unroll
-	for(int i = 0; i < LOOP_Y; i++) {
+	
+	if(!COLD){
 		#pragma unroll
-		for(int j = 0; j < LOOP_X; j++) {
+		for(int i = 0; i < LOOP_Y; i++) {
 			#pragma unroll
-			for(int k = 0; k < 8*sizeof(INT_T); k += BITXSP) {
-				if (curand_uniform(&st) < 0.5f) {
-					__tmp[i][j].x |= INT_T(1) << k;
-				}
-				if (curand_uniform(&st) < 0.5f) {
-					__tmp[i][j].y |= INT_T(1) << k;
+			for(int j = 0; j < LOOP_X; j++) {
+				#pragma unroll
+				for(int k = 0; k < 8*sizeof(INT_T); k += BITXSP) {  //flips each of the 16 many spins. 
+					if (curand_uniform(&st) < 0.5f) {
+						__tmp[i][j].x |= INT_T(1) << k;
+					}
+					if (curand_uniform(&st) < 0.5f) {
+						__tmp[i][j].y |= INT_T(1) << k;
+					}
 				}
 			}
-		}
+		}// In total 64 flips
 	}
 
 	#pragma unroll
@@ -377,12 +389,12 @@ __device__ void loadTileOLD(const long long begY,
 	return;
 }
 
-template<int BDIM_X,
-	 int BDIM_Y,
-	 int TILE_X,
-	 int TILE_Y,
-	 int FRAME_X,
-	 int FRAME_Y,
+template<int BDIM_X, // 16
+	 int BDIM_Y,     // 16
+	 int TILE_X,     // 32
+	 int TILE_Y,     // 16
+	 int FRAME_X,    // 1
+	 int FRAME_Y,    // 1
 	 typename INT2_T>
 __device__ void loadTile(const int slX,
 			 const int slY,
@@ -401,11 +413,11 @@ __device__ void loadTile(const int slX,
 	const int startY = begY + blky*TILE_Y;
 
 	#pragma unroll
-	for(int j = 0; j < TILE_Y; j += BDIM_Y) {
+	for(int j = 0; j < TILE_Y; j += BDIM_Y) { 					// j = 0
 		int yoff = startY + j+tidy;
 
 		#pragma unroll
-		for(int i = 0; i < TILE_X; i += BDIM_X) {
+		for(int i = 0; i < TILE_X; i += BDIM_X) {               // i =0,16
 			const int xoff = startX + i+tidx;
 			tile[FRAME_Y + j+tidy][FRAME_X + i+tidx] = v[yoff*dimX + xoff];
 		}
@@ -428,7 +440,7 @@ __device__ void loadTile(const int slX,
 		}
 
 		// the other branch in slower so skip it if possible
-		if (BDIM_X <= TILE_Y) {
+		if (BDIM_X <= TILE_Y) {                               // Always True
 
 			int xoff = (startX % slX) == 0 ? startX+slX-1 : startX-1;
 
@@ -460,33 +472,35 @@ __device__ void loadTile(const int slX,
 	return;
 }
 
-template<int BDIM_X,
-	 int BDIM_Y,
-	 int LOOP_X, 
-	 int LOOP_Y,
-	 int BITXSP,
-	 int COLOR,
+
+// called  with <<<grid, block>>>
+template<int BDIM_X, // = BLOCK_X
+	 int BDIM_Y,     // = BLOCK_Y
+	 int LOOP_X,     // = BMULT_X 
+	 int LOOP_Y,     // = BMULT_Y
+	 int BITXSP,     // = BIT_X_SPIN 
+	 int COLOR,      // = C_BLACK
 	 typename INT_T,
 	 typename INT2_T>
 __global__ 
-void spinUpdateV_2D_k(const int devid,
+void spinUpdateV_2D_k(const int devid, // = i
 		      const long long seed,
-		      const int it,
-		      const int slX, // sublattice size X of one color (in words)
-		      const int slY, // sublattice size Y of one color
-		      const long long begY,
-		      const long long dimX, // ld
-		      const float vExp[][5],
-		      const INT2_T *__restrict__ jDst,
-		      const INT2_T *__restrict__ vSrc,
-		            INT2_T *__restrict__ vDst) {
-
+		      const int it, // = j+1
+		      const int slX, // sublattice size X of one color (in words)  // = (XSL/2)/SPIN_X_WORD/2   = 0
+		      const int slY, // sublattice size Y of one color  		   // = YSL                     = 0
+		      const long long begY, // = i*Y 	/* = ndev*Y,*/ 
+		      const long long dimX, // ld  // = lld/2,
+		      const float vExp[][3][3],           // = reinterpret_cast<float (*)[5]>(exp_d[i]),
+		      const INT2_T *__restrict__ jDst, // = reinterpret_cast<ulonglong2 *>(hamW_d),
+		      const INT2_T *__restrict__ vSrc, // = reinterpret_cast<ulonglong2 *>(white_d),   // Source    surrounding spins
+		            INT2_T *__restrict__ vDst) // = reinterpret_cast<ulonglong2 *>(black_d));  // Target -> to be updated
+{ 
 	const int SPIN_X_WORD = 8*sizeof(INT_T)/BITXSP;
 
 	const int tidx = threadIdx.x;
 	const int tidy = threadIdx.y;
 
-	__shared__ INT2_T shTile[BDIM_Y*LOOP_Y+2][BDIM_X*LOOP_X+2];
+	__shared__ INT2_T shTile[BDIM_Y*LOOP_Y+2][BDIM_X*LOOP_X+2]; // Size of a tile: 2 * (16+2) * (32+2)
 
 	loadTile<BDIM_X, BDIM_Y,
 		 BDIM_X*LOOP_X,
@@ -494,15 +508,15 @@ void spinUpdateV_2D_k(const int devid,
 		 1, 1, INT2_T>(slX, slY, begY, dimX, vSrc, shTile);
 
 	// __shExp[cur_s{0,1}][sum_s{0,1}] = __expf(-2*cur_s{-1,+1}*F{+1,-1}(sum_s{0,1})*INV_TEMP)
-	__shared__ float __shExp[2][5];
+	__shared__ float __shExp[2][3][3];
 
 	// for small lattices BDIM_X/Y may be smaller than 2/5
 	#pragma unroll
 	for(int i = 0; i < 2; i += BDIM_Y) {
 		#pragma unroll
-		for(int j = 0; j < 5; j += BDIM_X) {
-			if (i+tidy < 2 && j+tidx < 5) {
-				__shExp[i+tidy][j+tidx] = vExp[i+tidy][j+tidx];
+		for(int j = 0; j < 9; j += BDIM_X) {
+			if (i+tidy < 2 && j+tidx < 9) {
+				__shExp[i+tidy][(j+tidx)%3][(j+tidx)/3] = vExp[i+tidy][(j+tidx)%3][(j+tidx)/3]; // Only call this once:  __shExp[tidy][tidx] = vExp[tidy][tidx]; and only for tidy=0,1 tidx = 0,1,2,3,4
 			}
 		}
 	}
@@ -518,30 +532,30 @@ void spinUpdateV_2D_k(const int devid,
 
 	#pragma unroll
 	for(int i = 0; i < LOOP_Y; i++) {
-		#pragma unroll
-		for(int j = 0; j < LOOP_X; j++) {
-			__me[i][j] = vDst[(begY+__i+i*BDIM_Y)*dimX + __j+j*BDIM_X];
+		#pragma unroll												    //                                                  tile
+		for(int j = 0; j < LOOP_X; j++) {                               //                                             vec2     multi-spin
+			__me[i][j] = vDst[(begY+__i+i*BDIM_Y)*dimX + __j+j*BDIM_X]; // copy local spin values (of which there are   2  *  2  *  16 = 64) that correspond to current global id
 		}
 	}
 
-	INT2_T __up[LOOP_Y][LOOP_X];
-	INT2_T __ct[LOOP_Y][LOOP_X];
-	INT2_T __dw[LOOP_Y][LOOP_X];
+	INT2_T __up[LOOP_Y][LOOP_X]; // up
+	INT2_T __ct[LOOP_Y][LOOP_X]; // center
+	INT2_T __dw[LOOP_Y][LOOP_X]; // down
+	INT2_T __sd[LOOP_Y][LOOP_X]; // side
 
 	#pragma unroll
-	for(int i = 0; i < LOOP_Y; i++) {
+	for(int i = 0; i < LOOP_Y; i++) {        
 		#pragma unroll
-		for(int j = 0; j < LOOP_X; j++) {
-			__up[i][j] = shTile[i*BDIM_Y +   tidy][j*BDIM_X + 1+tidx];
-			__ct[i][j] = shTile[i*BDIM_Y + 1+tidy][j*BDIM_X + 1+tidx];
+		for(int j = 0; j < LOOP_X; j++) {                                // (i,j) in (0,{0,1})
+			__up[i][j] = shTile[i*BDIM_Y +   tidy][j*BDIM_X + 1+tidx];   // +0,1,2 = -1,0,1 + FRAME_Y 
+			__ct[i][j] = shTile[i*BDIM_Y + 1+tidy][j*BDIM_X + 1+tidx];   //                         +1=FRAME_X
 			__dw[i][j] = shTile[i*BDIM_Y + 2+tidy][j*BDIM_X + 1+tidx];
 		}
 	}
 
 	// BDIM_Y is power of two so row parity won't change across loops
-	const int readBack = (COLOR == C_BLACK) ? !(__i%2) : (__i%2);
+	const int readBack = (COLOR == C_BLACK) ? !(__i%2) : (__i%2);  // Black and Odd Row ?  1 : 0
 
-	INT2_T __sd[LOOP_Y][LOOP_X];
 
 	#pragma unroll
 	for(int i = 0; i < LOOP_Y; i++) {
@@ -572,7 +586,7 @@ void spinUpdateV_2D_k(const int devid,
 		}
 	}
 
-	if (jDst != NULL) {
+	if (jDst != NULL) { // == NULL if not spin glass
 		INT2_T __J[LOOP_Y][LOOP_X];
 
 		#pragma unroll
@@ -590,16 +604,16 @@ void spinUpdateV_2D_k(const int devid,
 			#pragma unroll
 			for(int j = 0; j < LOOP_X; j++) {
 
-				__up[i][j].x ^= (__J[i][j].x & 0x8888888888888888ull) >> 3;
-				__up[i][j].y ^= (__J[i][j].y & 0x8888888888888888ull) >> 3;
+				__up[i][j].x ^= (__J[i][j].x & 0x8888888888888888ull) >> 3;   // 0x8 = 0b1000.  0x8 >> 3 = 0b0001
+				__up[i][j].y ^= (__J[i][j].y & 0x8888888888888888ull) >> 3;   // Taking least bit in spin J[i][j] and pushing it to the highest one
 
-				__dw[i][j].x ^= (__J[i][j].x & 0x4444444444444444ull) >> 2;
-				__dw[i][j].y ^= (__J[i][j].y & 0x4444444444444444ull) >> 2;
+				__dw[i][j].x ^= (__J[i][j].x & 0x4444444444444444ull) >> 2;   // 0x4 = 0b0100.  0x4 >> 2 = 0b0001
+				__dw[i][j].y ^= (__J[i][j].y & 0x4444444444444444ull) >> 2;   // Taking second least bit in spin J[i][j] and pushing it to the highest one
 
 				if (readBack) {
 					// __sd[][] holds "left" spins
 					// __ct[][] holds "right" spins
-					__sd[i][j].x ^= (__J[i][j].x & 0x2222222222222222ull) >> 1;
+					__sd[i][j].x ^= (__J[i][j].x & 0x2222222222222222ull) >> 1; // Taking second largest bit in spin J[i][j] and pushing it to the highest one 
 					__sd[i][j].y ^= (__J[i][j].y & 0x2222222222222222ull) >> 1;
 
 					__ct[i][j].x ^= (__J[i][j].x & 0x1111111111111111ull);
@@ -623,14 +637,12 @@ void spinUpdateV_2D_k(const int devid,
 	#pragma unroll
 	for(int i = 0; i < LOOP_Y; i++) {
 		#pragma unroll
-		for(int j = 0; j < LOOP_X; j++) {
-			__ct[i][j].x += __up[i][j].x;
-			__dw[i][j].x += __sd[i][j].x;
-			__ct[i][j].x += __dw[i][j].x;
+		for(int j = 0; j < LOOP_X; j++) {   // Add up all the four neighbouring spins and store it inside ct.
+			__dw[i][j].x += __up[i][j].x;
+			__ct[i][j].x += __sd[i][j].x;
 
-			__ct[i][j].y += __up[i][j].y;
-			__dw[i][j].y += __sd[i][j].y;
-			__ct[i][j].y += __dw[i][j].y;
+			__dw[i][j].y += __up[i][j].y;
+			__ct[i][j].y += __sd[i][j].y;
 		}
 	}
 
@@ -639,20 +651,23 @@ void spinUpdateV_2D_k(const int devid,
 		#pragma unroll
 		for(int j = 0; j < LOOP_X; j++) {
 			#pragma unroll
-			for(int z = 0; z < 8*sizeof(INT_T); z += BITXSP) {
+			for(int z = 0; z < 8*sizeof(INT_T); z += BITXSP) { // run over all 16 spins inside a 64bit word
 
-				const int2 __src = make_int2((__me[i][j].x >> z) & 0xF,
-							     (__me[i][j].y >> z) & 0xF);
+				const int2 __src = make_int2((__me[i][j].x >> z) & BIT_MASK,   // Get spin value from Multi-spin coding.
+							     (__me[i][j].y >> z) & BIT_MASK);
 
-				const int2 __sum = make_int2((__ct[i][j].x >> z) & 0xF,
-							     (__ct[i][j].y >> z) & 0xF);
+				const int2 __sum_J = make_int2((__ct[i][j].x >> z) & BIT_MASK,   // Get Neighbour sum value from Multi-spin coding.
+	  						     (__ct[i][j].y >> z) & BIT_MASK);
+
+				const int2 __sum_K = make_int2((__dw[i][j].x >> z) & BIT_MASK,   // Get Neighbour sum value from Multi-spin coding.
+	  						     (__dw[i][j].y >> z) & BIT_MASK);
 
 				const INT_T ONE = static_cast<INT_T>(1);
 
-				if (curand_uniform(&st) <= __shExp[__src.x][__sum.x]) {
+				if (curand_uniform(&st) <= __shExp[__src.x][__sum_J.x][__sum_K.x]) {
 					__me[i][j].x ^= ONE << z;
 				}
-				if (curand_uniform(&st) <= __shExp[__src.y][__sum.y]) {
+				if (curand_uniform(&st) <= __shExp[__src.y][__sum_J.y][__sum_K.y]) {
 					__me[i][j].y ^= ONE << z;
 				}
 			}
@@ -752,11 +767,11 @@ static void usage(const int SPIN_X_WORD, const char *pname) {
                 "\n"
                 "\t-n|--n <NSTEPS>\n"
 		"\t\tSpecifies the number of iteration to run.\n"
-		"\t\tDefualt: %4$d\n"
+		"\t\tDefault: %4$d\n"
                 "\n"
                 "\t-d|--devs <NUM_DEVICES>\n"
 		"\t\tSpecifies the number of GPUs to use. Will use devices with ids [0, NUM_DEVS-1].\n"
-		"\t\tDefualt: 1.\n"
+		"\t\tDefault: 1.\n"
                 "\n"
                 "\t-s|--seed <SEED>\n"
 		"\t\tSpecifies the seed used to generate random numbers.\n"
@@ -778,6 +793,12 @@ static void usage(const int SPIN_X_WORD, const char *pname) {
 		"\t\toption is ignored.\n"
 		"\t\tDefault: only at the beginning and at end of the simulation\n"
                 "\n"
+                "\t-w|--write <STAT_FREQ>,<FILE_NAME>\n"
+		"\t\tSpecifies the frequency, in no.  of  iteration,  with  which  the  magnetization\n"
+		"\t\tstatistics is saved to disk in the file file_name. Using raw binary double. \n" 
+		"\t\tThere should be no space after the comma in front of <FILE_NAME>.\n" 
+		"\t\tDefault: disabled\n"
+                "\n"
                 "\t-e|--exppr\n"
 		"\t\tPrints the magnetization at time steps in the series 0 <= 2^(x/4) < NSTEPS.   If\n"
 		"\t\tthis option is used  together  to  the  '-p'  option,  the  latter  is  ignored.\n"
@@ -788,6 +809,12 @@ static void usage(const int SPIN_X_WORD, const char *pname) {
 		"\t\twith the  %8$d points on the right and below.  The correlation is computed  every\n"
 		"\t\ttime the magnetization is printed on screen (based on either the  '-p'  or  '-e'\n"
 		"\t\toption) and it is written in the file one line per measure.\n"
+		"\t\tDefault: disabled\n"
+                "\n"
+                "\t-u|--update <STEP_SIZE>,<TEMP_STAT_FREQ>,<TEMP_END> \n"
+		"\t\t Will increase the temperature by <STEP_SIZE> (float)\n"
+		"\t\t every <TEMP_STAT_FREQ> (int) many steps, \n"
+		"\t\t and will stop at the optional parameter <TEMP_END> \n"
 		"\t\tDefault: disabled\n"
                 "\n"
                 "\t-m|--magn <TGT_MAGN>\n"
@@ -802,6 +829,11 @@ static void usage(const int SPIN_X_WORD, const char *pname) {
 		"\t\tSpecifies the probability [0.0-1.0] that links  connecting  any  two  spins  are\n"
 		"\t\tanti-ferromagnetic. \n"
 		"\t\tDefault: 0.0\n"
+                "\n"
+		"\t-K|--K <J>,<K>\n"
+		"\t\tSpecifies horizontal and vertical bond weights <J> and <K>, both positive.\n"
+		"\t\t<K> can be left empty as to choose <J>,1./<J>.\n"
+		"\t\tDefault: 1.0,1.0\n"
                 "\n"
 		"\t   --xsl <HORIZ_SUB_DIM>\n"
 		"\t\tSpecifies the horizontal dimension of each sub-lattice (black+white spins),  per\n"
@@ -1137,6 +1169,24 @@ static void computeCorr(const char *fname,
 	return;
 }
 
+static void writeMagnFile(const char* file_name, double magn[10000], int count=10000)
+{
+	static char abwb[3] = "wb";
+	FILE *file = fopen(file_name, abwb);
+	if (file == NULL) {
+		fprintf(stderr, "Could not open file for writing.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	size_t elements_written = fwrite(magn, sizeof(double), count, file);
+	if (elements_written != count) {
+		fprintf(stderr, "Could not write to file.\n");
+		exit(EXIT_FAILURE);
+	}
+	fclose(file);
+	abwb[0] = 'a';
+}
+
 static void dumpLattice(const char *fprefix,
 			const int ndev,
 			const int Y,
@@ -1263,9 +1313,15 @@ int main(int argc, char **argv) {
 	float temp  = -1.0f;
 
 	float tempUpdStep = 0;
+	float tempEnd = 0;
 	int   tempUpdFreq = 0;
 
 	int printFreq = 0;
+
+	int writeFreq = 0;
+	char writeName[256];
+	double writeMagn[10000];
+	int writeCur = 0;
 
 	int printExp = 0;
 	int printExpCur = 0;
@@ -1282,6 +1338,9 @@ int main(int argc, char **argv) {
 	int NSLX = 1;
 	int NSLY = 1;
 
+	float K[2] = {1.f, 1.f};
+	int anIsotropic = 0;
+
 	int och;
 	while(1) {
 		int option_index = 0;
@@ -1296,17 +1355,19 @@ int main(int argc, char **argv) {
 			{  "temp", required_argument, 0, 't'},
 			{ "print", required_argument, 0, 'p'},
 			{"update", required_argument, 0, 'u'},
+			{ "write", required_argument, 0, 'w'},
 			{  "magn", required_argument, 0, 'm'},
 			{ "exppr",       no_argument, 0, 'e'},
 			{  "corr",       no_argument, 0, 'c'},
 			{     "J", required_argument, 0, 'J'},
+			{     "K", required_argument, 0, 'K'},
 			{   "xsl", required_argument, 0,   1},
 			{   "ysl", required_argument, 0,   2},
 			{  "help", required_argument, 0, 'h'},
 			{       0,                 0, 0,   0}
 		};
 
-		och = getopt_long(argc, argv, "x:y:n:ohs:d:a:t:p:u:m:ecJ:r:", long_options, &option_index);
+		och = getopt_long(argc, argv, "x:y:n:ohs:d:a:t:p:w:u:m:ecJK:r:", long_options, &option_index);
 		if (och == -1) break;
 		switch (och) {
 			case   0:// handles long opts with non-NULL flag field
@@ -1329,7 +1390,7 @@ int main(int argc, char **argv) {
 			case 's':
 				seed = atoll(optarg);
 				if(seed==0) {
-					seed=((getpid()*rand())&0x7FFFFFFFF);
+					seed=((getpid()*rand())&0xFFFFFFFFF);
 				}
 				break;
 			case 'd':
@@ -1343,6 +1404,25 @@ int main(int argc, char **argv) {
 				break;
 			case 'p':
 				printFreq = atoi(optarg);
+				break;
+			case 'w':
+				{
+					char *__tmp0 = strtok(optarg, ",");
+					if (!__tmp0) {
+						fprintf(stderr, "cannot find stepsize in parameter...\n");
+						exit(EXIT_FAILURE);
+					}
+					const char *__tmp1 = strtok(NULL, ",");
+					if (!__tmp1) {
+						__tmp1 = "magnetization";
+					}
+					strncpy(writeName, __tmp1, strnlen(__tmp1, 255));
+					writeName[strnlen(__tmp1, 255)] = '\0';
+
+					writeFreq = atoi(__tmp0);
+					
+					printf("Writing every %i magnetization to %s\n", writeFreq, writeName);
+				}
 				break;
 			case 'e':
 				printExp = 1;
@@ -1360,9 +1440,15 @@ int main(int argc, char **argv) {
 						fprintf(stderr, "cannot find iteration count in parameter...\n");
 						exit(EXIT_FAILURE);
 					}
+					char *__tmp2 = strtok(NULL, ",");
+					if (__tmp2) {
+						tempEnd= atof(__tmp2);
+					}
 					tempUpdStep = atof(__tmp0);
 					tempUpdFreq = atoi(__tmp1);
-					printf("tempUpdStep: %f, tempUpdFreq: %d\n", tempUpdStep, tempUpdFreq);
+					printf("tempUpdStep: %f, tempUpdFreq: %d", tempUpdStep, tempUpdFreq);
+					if(tempEnd == 0) printf("\n");
+					else printf(", tempEnd = %f\n", tempEnd);
 				}
 				break;
 			case 'm':
@@ -1375,6 +1461,23 @@ int main(int argc, char **argv) {
 				useGenHamilt = 1;
 				hamiltPerc1 = atof(optarg);
 				hamiltPerc1 = MIN(MAX(0.0f, hamiltPerc1), 1.0f);
+				break;
+			case 'K':
+				{
+					char *__tmp0 = strtok(optarg, ",");
+					if (!__tmp0) {
+						fprintf(stderr, "cannot find J value in parameter...\n");
+						exit(EXIT_FAILURE);
+					}
+					K[0] = atof(__tmp0);
+					const char *__tmp1 = strtok(NULL, ",");
+					if (!__tmp1) {
+						K[1] = 1./K[0];	
+					}else
+						K[1] = atof(__tmp1);
+					printf("Bond weights are J=%f, K=%f\n", K[0], K[1]);
+					anIsotropic = 1;
+				}
 				break;
 			case 1:
 				useSubLatt = 1;
@@ -1536,7 +1639,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	size_t lld = (X/2)/SPIN_X_WORD;
+	size_t lld = (X/2)/SPIN_X_WORD; // X*Y spins correspond to llenLoc = lld * Y  64bit words times two (for each color).
 
 	// length of a single color section per GPU
 	size_t llenLoc = static_cast<size_t>(Y)*lld;
@@ -1544,14 +1647,14 @@ int main(int argc, char **argv) {
 	// total lattice length (all GPUs, all colors)
 	size_t llen = 2ull*ndev*llenLoc;
 
-	dim3 grid(DIV_UP(lld/2, BLOCK_X*BMULT_X),
-		  DIV_UP(    Y, BLOCK_Y*BMULT_Y));
+	dim3 grid(DIV_UP(lld/2, BLOCK_X*BMULT_X /* = 16 or 32 */),
+		  DIV_UP(    Y, BLOCK_Y*BMULT_Y /* = 16 */));
 
 	dim3 block(BLOCK_X, BLOCK_Y);
 
 	printf("Run configuration:\n");
 	printf("\tspin/word: %d\n", SPIN_X_WORD);
-	printf("\tspins: %zu\n", llen*SPIN_X_WORD);
+	printf("\tspins: %zu\n", llen * SPIN_X_WORD);
 	printf("\tseed: %llu\n", seed);
 	printf("\titerations: %d\n", nsteps);
 	printf("\tblock (X, Y): %d, %d\n", block.x, block.y);
@@ -1560,6 +1663,8 @@ int main(int argc, char **argv) {
 
 	if (printFreq) {
 		printf("\tprint magn. every %d steps\n", printFreq);
+	} else if (writeFreq) {
+		printf("\twrites magn. every %d steps to %s\n", writeFreq, writeName);
 	} else if (printExp) {
 		printf("\tprint magn. following exponential series\n");
 	} else {
@@ -1573,12 +1678,19 @@ int main(int argc, char **argv) {
 		printf("\ttemp update not set\n");
 	} else {
 		printf("\ttemp update: %f / %d iterations\n", tempUpdStep, tempUpdFreq);
+		if(tempEnd)
+			printf("\tStop simulation at temperature %f\n", tempEnd);
 	}
 	if (useGenHamilt) {
 		printf("\tusing Hamiltonian buffer, setting links to -1 with prob %G\n", hamiltPerc1);
+		printf("Not implemented\n");
+		exit(EXIT_FAILURE); 
 	} else {
 		printf("\tnot using Hamiltonian buffer\n");
 	}
+	if (anIsotropic) {
+		printf("\tusing anisotropic bond weights J=%f, K=%f\n", K[0], K[1]);
+	} 
 
 	printf("\n");
 	if (useSubLatt) {
@@ -1587,7 +1699,7 @@ int main(int argc, char **argv) {
 		printf("\t\tno. of sub-lattices (total): %8d\n", ndev*NSLX*NSLY);
 		printf("\t\tsub-lattices size:           %7d x %7d\n\n", XSL, YSL);
 	}
-	printf("\tlocal lattice size:      %8d x %8d\n",      Y, X);
+	printf("\tlocal lattice size (Y,X):%8d x %8d\n",      Y, X);
 	printf("\ttotal lattice size:      %8d x %8d\n", ndev*Y, X);
 	printf("\tlocal lattice shape: 2 x %8d x %8zu (%12zu %s)\n",      Y, lld, llenLoc*2, sizeof(*v_d) == 4 ? "uints" : "ulls");
 	printf("\ttotal lattice shape: 2 x %8d x %8zu (%12zu %s)\n", ndev*Y, lld,      llen, sizeof(*v_d) == 4 ? "uints" : "ulls");
@@ -1678,28 +1790,30 @@ int main(int argc, char **argv) {
 	}
 
 	float *exp_d[MAX_GPU];
-	float  exp_h[2][5];
+	float  exp_h[2][3][3];
 
 	// precompute possible exponentials
 	for(int i = 0; i < 2; i++) {
-		for(int j = 0; j < 5; j++) {
-			if(temp > 0) {
-				exp_h[i][j] = expf((i?-2.0f:2.0f)*static_cast<float>(j*2-4)*(1.0f/temp));
-			} else {
-				if(j == 2) {
-					exp_h[i][j] = 0.5f;
-				} else {
-					exp_h[i][j] = (i?-2.0f:2.0f)*static_cast<float>(j*2-4);
+		for(int j = 0; j < 3; j++) {
+			for(int k = 0; k < 3; k++) {
+				if(temp > 0) {
+					exp_h[i][j][k] = expf((i?-2.0f:2.0f)*(K[0]*static_cast<float>(j*2-2)+K[1]*static_cast<float>(k*2-2))*(1.0f/temp));
+				} else { /* Not implemented
+					if(j == 2) {
+						exp_h[i][j] = 0.5f;
+					} else {
+						exp_h[i][j] = (i?-2.0f:2.0f)*static_cast<float>(j*2-4);
+					}
+					*/
 				}
 			}
-			//printf("exp[%2d][%d]: %E\n", i?1:-1, j, exp_h[i][j]);
 		}
 	}
 
 	for(int i = 0; i < ndev; i++) {
 		CHECK_CUDA(cudaSetDevice(i));
-		CHECK_CUDA(cudaMalloc(exp_d+i, 2*5*sizeof(**exp_d)));
-		CHECK_CUDA(cudaMemcpy(exp_d[i], exp_h, 2*5*sizeof(**exp_d), cudaMemcpyHostToDevice));
+		CHECK_CUDA(cudaMalloc(exp_d+i, 2*9*sizeof(**exp_d)));
+		CHECK_CUDA(cudaMemcpy(exp_d[i], exp_h, 2*9*sizeof(**exp_d), cudaMemcpyHostToDevice));
 	}
 
 	CHECK_CUDA(cudaEventCreate(&start));
@@ -1707,10 +1821,10 @@ int main(int argc, char **argv) {
 
 	for(int i = 0; i < ndev; i++) {
 		CHECK_CUDA(cudaSetDevice(i));
-		latticeInit_k<BLOCK_X, BLOCK_Y,
+		latticeInit_k<BLOCK_X, BLOCK_Y,                            // Randomizes Initial State for each black tile (64 resp 128 spins)
 			      BMULT_X, BMULT_Y,
 			      BIT_X_SPIN, C_BLACK,
-			      unsigned long long><<<grid, block>>>(i,
+			      unsigned long long, ulonglong2, COLD_START><<<grid, block>>>(i,
 								   seed,
 								   0, i*Y, lld/2,
 								   reinterpret_cast<ulonglong2 *>(black_d));
@@ -1719,7 +1833,7 @@ int main(int argc, char **argv) {
 		latticeInit_k<BLOCK_X, BLOCK_Y,
 			      BMULT_X, BMULT_Y,
 			      BIT_X_SPIN, C_WHITE,
-			      unsigned long long><<<grid, block>>>(i,
+			      unsigned long long, ulonglong2, COLD_START><<<grid, block>>>(i,
 								   seed,
 								   0, i*Y, lld/2,
 								   reinterpret_cast<ulonglong2 *>(white_d));
@@ -1771,7 +1885,7 @@ int main(int argc, char **argv) {
 									      j+1,
 									      (XSL/2)/SPIN_X_WORD/2, YSL,
 									      i*Y, /*ndev*Y,*/ lld/2,
-							 		      reinterpret_cast<float (*)[5]>(exp_d[i]),
+							 		      reinterpret_cast<float (*)[3][3]>(exp_d[i]),
 									      reinterpret_cast<ulonglong2 *>(hamW_d),
 									      reinterpret_cast<ulonglong2 *>(white_d),
 									      reinterpret_cast<ulonglong2 *>(black_d));
@@ -1792,7 +1906,7 @@ int main(int argc, char **argv) {
 									      j+1,
 									      (XSL/2)/SPIN_X_WORD/2, YSL,
 									      i*Y, /*ndev*Y,*/ lld/2,
-							 		      reinterpret_cast<float (*)[5]>(exp_d[i]),
+							 		      reinterpret_cast<float (*)[3][3]>(exp_d[i]),
 									      reinterpret_cast<ulonglong2 *>(hamB_d),
 									      reinterpret_cast<ulonglong2 *>(black_d),
 									      reinterpret_cast<ulonglong2 *>(white_d));
@@ -1823,6 +1937,15 @@ int main(int argc, char **argv) {
 				}
 			}
 		}
+		if (writeFreq && ((j+1) % writeFreq) == 0) {
+			countSpins(ndev, redBlocks, llen, llenLoc, black_d, white_d, sum_d, &cntPos, &cntNeg);
+			const double magn = abs(static_cast<double>(cntPos)-static_cast<double>(cntNeg)) / (llen*SPIN_X_WORD);
+			writeMagn[writeCur++] = magn;
+			if (writeCur == 10000) {
+				writeMagnFile(writeName, writeMagn);
+				writeCur = 0;
+			}
+		}
 		//printf("j: %d, printExpSteps[%d]: %d\n", j, printExpCur, printExpSteps[printExpCur]);
 		if (printExp && printExpSteps[printExpCur] == j) {
 			printExpCur++;
@@ -1847,18 +1970,27 @@ int main(int argc, char **argv) {
 		}
 		if (tempUpdFreq && ((j+1) % tempUpdFreq) == 0) {
 			temp = MAX(MIN_TEMP, temp+tempUpdStep);
+			if(tempEnd && (tempUpdStep > 0)  && temp > tempEnd) break;
+			else if(tempEnd && (tempUpdStep < 0)  && temp < tempEnd) break;
 			printf("Changing temperature to %f\n", temp);
 			for(int i = 0; i < 2; i++) {
-				for(int k = 0; k < 5; k++) {
-					exp_h[i][k] = expf((i?-2.0f:2.0f)*static_cast<float>(k*2-4)*(1.0f/temp));
-					printf("exp[%2d][%d]: %E\n", i?1:-1, k, exp_h[i][k]);
+				for(int j = 0; j < 3; j++) {
+					for(int k = 0; k < 3; k++) {
+						exp_h[i][j][k] = expf((i?-2.0f:2.0f)*(K[0]*static_cast<float>(j*2-2)+K[1]*static_cast<float>(k*2-2))*(1.0f/temp));
+						//printf("exp[%2d][%d][%d]: %E\n", i?1:-1, j, k, exp_h[i][j][k]);
+					}
 				}
 			}
 			for(int i = 0; i < ndev; i++) {
-				CHECK_CUDA(cudaMemcpy(exp_d[i], exp_h, 2*5*sizeof(**exp_d), cudaMemcpyHostToDevice));
+				CHECK_CUDA(cudaMemcpy(exp_d[i], exp_h, 2*9*sizeof(**exp_d), cudaMemcpyHostToDevice));
 			}
 		}
 	}
+
+	if (writeFreq && (writeCur != 0)){
+		writeMagnFile(writeName, writeMagn, writeCur);
+	}
+
 	if (ndev == 1) {
 		CHECK_CUDA(cudaEventRecord(stop, 0));
 		CHECK_CUDA(cudaEventSynchronize(stop));
@@ -1886,7 +2018,7 @@ int main(int argc, char **argv) {
 		//(llen*sizeof(*v_d)*2*j/1.0E+9) / (et/1.0E+3));
 		(2ull*j*
 		 	( sizeof(*v_d)*((llen/2) + (llen/2) + (llen/2)) + // src color read, dst color read, dst color write
-			  sizeof(*exp_d)*5*grid.x*grid.y ) /
+			  sizeof(*exp_d)*9*grid.x*grid.y ) /
 		1.0E+9) / (et/1.0E+3));
 
 
